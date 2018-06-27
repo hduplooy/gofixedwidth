@@ -1,6 +1,6 @@
 // github.com/hduplooy/gofixedwidth
 // Author: Hannes du Plooy
-// Revision Date: 28 Sep 2016
+// Revision Date: 26 Jun 2018
 // Package gofixedwidth is similar to the normal encoding/csv. The difference being that the
 // columns are defined with fixed widths.
 // For the input the following can be defined:
@@ -9,7 +9,7 @@
 //   SkipStart - indicates the number of bytes to skip on an input line before the columns are read (or to write before rest of columns are written)
 //   SkipEnd - indicate how many bytes at the end of eache line to ignore (or to write after rest of columns are written)
 //   TrimFields - if set all fields are trimmed (front and back) when read
-//   HasEOL - indicates if lines have a CRLF (or LF, or CR), when writing a CR + LF will be appended
+//   HasEOL - indicates if lines have a CRLF or LF, or CR, when writing a CR + LF will be appended
 //   FieldLengths - is a slice with the lengths of the fields
 //
 // For each line a slice of strings are returned when read
@@ -21,6 +21,18 @@ import (
 	"fmt"
 	"io"
 	"strings"
+)
+
+const (
+	EOLNONE = iota
+	EOLCR
+	EOLLF
+	EOLCRLF
+)
+
+const (
+	ALIGNLEFT = iota
+	ALIGNRIGHT
 )
 
 // Used to generate any errors experienced
@@ -48,16 +60,18 @@ var (
 //   SkipStart - indicates the number of bytes to skip on an input line before the columns are read (or to write before rest of columns are written)
 //   SkipEnd - indicate how many bytes at the end of eache line to ignore (or to write after rest of columns are written)
 //   TrimFields - if set all fields are trimmed (front and back) when read
-//   HasEOL - indicates if lines have a CRLF (or LF, or CR), when writing a CR + LF will be appended
+//   HasEOL - indicates if lines have a CRLF or LF, or CR, when writing a CR + LF will be appended
 //   FieldLengths - is a slice with the lengths of the fields
+//	 FieldAlign - this slice contains the alignment of the field (not really of use with reading)
 type Reader struct {
 	Comment         rune
 	SkipLines       int
 	SkipStart       int
 	SkipEnd         int
 	FieldLengths    []int
+	FieldAlign      []int
 	TrimFields      bool
-	HasEOL          bool
+	HasEOL          int
 	width           int
 	line            int
 	column          int
@@ -65,9 +79,57 @@ type Reader struct {
 	r               *bufio.Reader
 }
 
-// updateWidth updates width before everyline seeing that input
+// readLine - read the next line from input based on the type of line delimeter (or none)
+
+func (r *Reader) readLine() (string, error) {
+	switch r.HasEOL {
+	// Read up to the first CR
+	case EOLCR:
+		tmp, err := r.r.ReadString(13)
+		if err != nil {
+			return tmp, err
+		}
+		return tmp[:len(tmp)-1], nil
+
+		// Read up to the first LF
+	case EOLLF:
+		tmp, err := r.r.ReadString(10)
+		if err != nil {
+			return tmp, err
+		}
+		return tmp[:len(tmp)-1], nil
+
+		// Read up to the first CR and LF
+	case EOLCRLF:
+		tmp, err := r.r.ReadString(13)
+		if err != nil {
+			return tmp, err
+		}
+		b, err := r.r.ReadByte()
+		if err != nil {
+			return tmp, err
+		}
+		if err == nil && b == 10 {
+			return tmp, nil
+		}
+		return tmp[:len(tmp)-1], errors.New("CRLF not found at end of line")
+
+		// Read number of bytes based on width of fields
+	case EOLNONE:
+		tmp2 := make([]byte, r.width)
+		_, err := r.r.Read(tmp2)
+		if err != nil {
+			return "", err
+		}
+		tmp3 := string(tmp2)
+		return tmp3, nil
+	}
+	return "", errors.New("Nothing to return")
+}
+
+// Init updates width before everyline seeing that input
 // can have different lines and thus the details can differ
-func (r *Reader) updateWidth() error {
+func (r *Reader) Init() error {
 	if r.SkipStart < 0 {
 		r.SkipStart = 0
 	}
@@ -84,12 +146,21 @@ func (r *Reader) updateWidth() error {
 		}
 		r.width += val
 	}
+	// Create a default FieldAlign if none found with all fields aligned left
+	if r.FieldAlign == nil {
+		r.FieldAlign = make([]int, len(r.FieldLengths))
+		for i := 0; i < len(r.FieldAlign); i++ {
+			r.FieldAlign[i] = ALIGNLEFT
+		}
+	}
 	return nil
 }
 
 // NewReader returns a struct with the controls for fixed width reading
 func NewReader(r io.Reader) *Reader {
-	return &Reader{HasEOL: true, r: bufio.NewReader(r)}
+	tmp := &Reader{HasEOL: EOLCRLF, r: bufio.NewReader(r)}
+	tmp.Init()
+	return tmp
 }
 
 // error generates a ParseError with necessary information
@@ -104,58 +175,34 @@ func (r *Reader) error(err error) error {
 // If HasEOL is defined and no CR/LF follows it means there are extra characters on the line which is an error
 // Then based on the field lengths the fields are extracted and trimmed (if defined).
 func (r *Reader) parseRecord() (fields []string, err error) {
-	var tmp = make([]byte, r.width)
-	if r.HasEOL && r.Comment != '\000' {
-		b, _, err := r.r.ReadRune()
-		if err != nil {
-			return nil, err
-		}
-		for b == r.Comment {
-			_, _, err = r.r.ReadLine()
-			if err != nil {
-				return nil, err
-			}
-			b, _, err = r.r.ReadRune()
-			if err != nil {
-				return nil, err
-			}
-		}
-		r.r.UnreadRune()
-	}
-	n, err := r.r.Read(tmp)
+	tmp, err := r.readLine()
 	if err != nil {
 		return nil, err
 	}
-	if n != r.width {
+	// Get rid of comment lines
+	if r.Comment != 0 && rune(tmp[0]) == r.Comment {
+		for rune(tmp[0]) == r.Comment {
+			tmp, err = r.readLine()
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(tmp) != r.width {
 		return nil, ErrIncorrectLineWidth
 	}
 	for _, val := range tmp {
+		// There shouldn't be any CR or LF chars in the input
 		if val == 13 || val == 10 {
 			fmt.Printf("Contains cr or lf")
 			return nil, ErrIncorrectLineWidth
 		}
 	}
-	if r.HasEOL {
-		b, err := r.r.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		if b != 13 && b != 10 {
-			return nil, ErrIncorrectLineWidth
-		}
-		if b == 10 {
-			b, err := r.r.ReadByte()
-			if b != 13 && err == nil {
-				r.r.UnreadByte()
-			}
-		}
-	}
-
 	var result = make([]string, 0, len(r.FieldLengths))
-	curpos := r.SkipStart
-	for _, val := range r.FieldLengths {
-		field := string(tmp[curpos : curpos+val])
-		if r.TrimFields {
+	curpos := r.SkipStart                // Skip the necessary chars in beginning of line prescribed by SkipStart
+	for _, val := range r.FieldLengths { // For each field extract the information
+		field := string(tmp[curpos : curpos+val]) // Extract the field
+		if r.TrimFields {                         // If fields must be trimmed remove any leading and trailing spaces and tabs
 			field = strings.Trim(field, " \t")
 		}
 		curpos += val
@@ -167,12 +214,10 @@ func (r *Reader) parseRecord() (fields []string, err error) {
 // skipInitialLines - will only be called once after the definition of Reader
 // it will skip the number of lines defined (if defined)
 func (r *Reader) skipInitialLines() error {
-	if r.HasEOL {
-		for i := 0; i < r.SkipLines; i++ {
-			_, _, err := r.r.ReadLine()
-			if err != nil {
-				return err
-			}
+	for i := 0; i < r.SkipLines; i++ {
+		_, err := r.readLine()
+		if err != nil {
+			return err
 		}
 	}
 	r.initialskipdone = true
@@ -181,12 +226,8 @@ func (r *Reader) skipInitialLines() error {
 
 // Read will read one line of fields from the input and return it
 func (r *Reader) Read() ([]string, error) {
-	err := r.updateWidth()
-	if err != nil {
-		return nil, r.error(err)
-	}
 	if !r.initialskipdone {
-		err = r.skipInitialLines()
+		err := r.skipInitialLines()
 		if err != nil {
 			return nil, r.error(err)
 		}
@@ -196,12 +237,8 @@ func (r *Reader) Read() ([]string, error) {
 
 // ReadRows read a specified number of rows from the input
 func (r *Reader) ReadRows(numOfRows int) ([][]string, error) {
-	err := r.updateWidth()
-	if err != nil {
-		return nil, r.error(err)
-	}
 	if !r.initialskipdone {
-		err = r.skipInitialLines()
+		err := r.skipInitialLines()
 		if err != nil {
 			return nil, r.error(err)
 		}
@@ -219,12 +256,8 @@ func (r *Reader) ReadRows(numOfRows int) ([][]string, error) {
 
 // ReadAll will read all lines from the input
 func (r *Reader) ReadAll() ([][]string, error) {
-	err := r.updateWidth()
-	if err != nil {
-		return nil, r.error(err)
-	}
 	if !r.initialskipdone {
-		err = r.skipInitialLines()
+		err := r.skipInitialLines()
 		if err != nil {
 			return nil, r.error(err)
 		}
@@ -233,23 +266,30 @@ func (r *Reader) ReadAll() ([][]string, error) {
 	for {
 		record, err := r.parseRecord()
 		if err != nil {
-			return result, r.error(err)
+			if err.Error() == "EOF" {
+				err = nil
+			}
+			return result, err
 		}
 		result = append(result, record)
 	}
 }
 
 // Writer is used to control the writing to the output stream
+//   Comment - if defined it is used to indicate a comment line starting with this rune
 //   SkipStart - indicates the number of spaces to write before rest of columns are written)
 //   SkipEnd - indicate how many spaces at the end of eache line to add
 //   TrimFields - if set all fields are trimmed if they are too big else an error is returned
 //   HasEOL - indicates that a CRLF must be added to each line
 //   FieldLengths - is a slice with the lengths of the fields
+//   FieldAlign - is a slice that contains the individual alignment of each field
 type Writer struct {
+	Comment      rune
 	SkipStart    int
 	SkipEnd      int
 	FieldLengths []int
-	HasEOL       bool
+	FieldAlign   []int
+	HasEOL       int
 	TrimFields   bool
 	width        int
 	line         int
@@ -257,9 +297,9 @@ type Writer struct {
 	w            *bufio.Writer
 }
 
-// updateWidth updates width before everyline seeing that output
+// Init updates width before everyline seeing that output
 // can have different lines and thus the details can differ
-func (r *Writer) updateWidth() error {
+func (r *Writer) Init() error {
 	if r.SkipStart < 0 {
 		r.SkipStart = 0
 	}
@@ -276,12 +316,21 @@ func (r *Writer) updateWidth() error {
 		}
 		r.width += val
 	}
+	// Create default alignment if none was defined
+	if r.FieldAlign == nil {
+		r.FieldAlign = make([]int, len(r.FieldLengths))
+		for i := 0; i < len(r.FieldAlign); i++ {
+			r.FieldAlign[i] = ALIGNLEFT
+		}
+	}
 	return nil
 }
 
 // NewWriter returns a struct with the controls for fixed width writing
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{HasEOL: true, w: bufio.NewWriter(w)}
+	tmp := &Writer{HasEOL: EOLCR, w: bufio.NewWriter(w)}
+	tmp.Init()
+	return tmp
 }
 
 // error generates a ParseError with necessary information
@@ -298,6 +347,7 @@ func (w *Writer) outputSpaces(n int) {
 }
 
 // Write will first output the defined number of spaces at the front (SkipStart)
+// the output can be left aligned or right aligned and spaces will be added to accomplish this
 // then the fields are output (trimmed if need be) and then any trailing spaces are added (if SkipEnd is defined)
 // If HasEOL is defined CR and LF will be send to output
 func (w *Writer) Write(flds []string) error {
@@ -321,20 +371,32 @@ func (w *Writer) Write(flds []string) error {
 				return ErrFieldLengthError
 			}
 		} else {
-			n, err = w.w.Write(buf)
+			n = len(buf)
+			// Add spaces in front if aligned right
+			if w.FieldAlign[i] == ALIGNRIGHT {
+				w.outputSpaces(w.FieldLengths[i] - n)
+			}
+			_, err = w.w.Write(buf)
 			if err != nil {
 				return err
 			}
 			if n != len(buf) {
 				return ErrFieldLengthError
 			}
-			w.outputSpaces(w.FieldLengths[i] - n)
+			// Add spaces at back if aligned left
+			if w.FieldAlign[i] == ALIGNLEFT {
+				w.outputSpaces(w.FieldLengths[i] - n)
+			}
 		}
 	}
 	w.outputSpaces(w.SkipEnd)
-	if w.HasEOL {
-		w.w.WriteByte(13)
-		w.w.WriteByte(10)
+	if w.HasEOL != EOLNONE {
+		if w.HasEOL == EOLCR || w.HasEOL == EOLCRLF {
+			w.w.WriteByte(13)
+		}
+		if w.HasEOL == EOLLF || w.HasEOL == EOLCRLF {
+			w.w.WriteByte(10)
+		}
 	}
 	return nil
 }
@@ -354,4 +416,34 @@ func (w *Writer) WriteAll(recs [][]string) error {
 // Flush will flush the output stream
 func (w *Writer) Flush() {
 	w.w.Flush()
+}
+
+// WriteComment send a comment character and the provided line to the output
+func (w *Writer) WriteComment(line string) error {
+	if w.Comment != 0 {
+		_, err := w.w.WriteRune(w.Comment)
+		if err != nil {
+			return err
+		}
+		if len(line)+1 > w.width {
+			line = line[0 : w.width-1]
+		}
+		_, err = w.w.WriteString(line)
+		if len(line)+1 < w.width {
+			w.outputSpaces(w.width - len(line) - 1)
+		}
+		if err != nil {
+			return err
+		}
+		// Output line delimeter if defined
+		if w.HasEOL != EOLNONE {
+			if w.HasEOL == EOLCR || w.HasEOL == EOLCRLF {
+				w.w.WriteByte(13)
+			}
+			if w.HasEOL == EOLLF || w.HasEOL == EOLCRLF {
+				w.w.WriteByte(10)
+			}
+		}
+	}
+	return nil
 }
